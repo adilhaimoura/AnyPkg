@@ -1,0 +1,18 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=AnyPkg — Universal Native Package Installer
+GenericName=Universal Linux Package Converter & Installer
+Comment=Convert and install .deb, .rpm, .pkg.tar.zst, .AppImage, .apk, .xbps, .txz, .eopkg, .snap, and .tar.* natively on your distro in one click
+Exec=/usr/local/bin/anypkg %f
+Icon=package-x-generic
+Terminal=false
+Categories=System;PackageManager;GTK;
+MimeType=application/vnd.debian.binary-package;application/x-deb;application/x-debian-package;application/x-rpm;application/x-redhat-package-manager;application/vnd.appimage;application/x-iso9660-appimage;application/vnd.snap;application/x-xz-compressed-tar;application/x-zstd-compressed-tar;
+StartupNotify=true
+Actions=AutoInstall;
+
+[Desktop Action AutoInstall]
+Name=One-Click Convert & Install Natively
+Exec=/usr/local/bin/anypkg --auto %f
+Icon=system-software-install
