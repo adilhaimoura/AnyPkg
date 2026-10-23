@@ -41,7 +41,7 @@ Designed for **`1360x766` laptop screens** (and scaling cleanly to larger deskto
 ## Installation (Arch, Ubuntu/Mint/Debian, Fedora, openSUSE)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/anypkg.git
+git clone https://github.com/adilhaimoura/anypkg.git
 cd anypkg
 chmod +x install.sh
 ./install.sh
