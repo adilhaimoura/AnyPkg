@@ -1003,7 +1003,6 @@ def normalize_usrmerge(stage_dir: Path, log_fn):
 
 # ---------------------------------------------------------------------------
 # Package Exporters / Builders for All Target Formats
-# (.pkg.tar.zst, .deb, .rpm, .AppImage, .apk, .xbps, .txz, .tar.zst)
 # ---------------------------------------------------------------------------
 def calc_dir_size_bytes(stage_dir: Path) -> int:
     total = 0
@@ -1220,16 +1219,10 @@ def build_appimage_from_stage(
     output_dir: Path,
     log_fn,
 ) -> Path | None:
-    """
-    Build a portable, self-contained .AppImage from `stage_dir` (e.g. .deb -> .AppImage, .rpm -> .AppImage).
-    Creates `AppRun`, root `.desktop` & icon, packs SquashFS via `mksquashfs` (or `appimagetool`),
-    and attaches a universal FUSE/unsquashfs self-executing AppImage header.
-    """
     normalize_usrmerge(stage_dir, log_fn)
     clean_name = sanitize_pkgname(pkgname)
     clean_ver = sanitize_pkgver(pkgver)
 
-    # Locate main executable inside stage_dir
     main_exec_rel = None
     usr_bin = stage_dir / "usr" / "bin"
     if usr_bin.exists():
@@ -1254,7 +1247,6 @@ def build_appimage_from_stage(
     if not main_exec_rel:
         main_exec_rel = f"usr/bin/{clean_name}"
 
-    # Create AppRun at root of stage_dir
     apprun = stage_dir / "AppRun"
     apprun_content = f"""#!/usr/bin/env bash
 HERE="$(dirname "$(readlink -f "${{0}}")")"
@@ -1268,7 +1260,6 @@ exec "$HERE/{main_exec_rel}" "$@"
     apprun.write_text(apprun_content, encoding="utf-8")
     apprun.chmod(0o755)
 
-    # Ensure root .desktop file exists inside AppDir
     desktop_files = list((stage_dir / "usr" / "share" / "applications").glob("*.desktop")) if (stage_dir / "usr" / "share" / "applications").exists() else []
     if desktop_files:
         shutil.copy2(desktop_files[0], stage_dir / f"{clean_name}.desktop")
@@ -1317,7 +1308,6 @@ Categories=Utility;
         log_fn(f"mksquashfs error: {proc.stderr}")
         return None
 
-    # Prepend self-contained AppImage launcher header (supports --appimage-extract and FUSE-less execution)
     stub_header = b"""#!/usr/bin/env bash
 set -e
 SELF="$(readlink -f "$0")"
@@ -1429,7 +1419,6 @@ def build_apk_or_xbps_or_txz_or_tarball(
         )
         return out_file if proc.returncode == 0 and out_file.exists() else None
 
-    # Standalone Binary Tarball (.tar.zst)
     out_file = output_dir / f"{clean_name}-{clean_ver}-x86_64.tar.zst"
     log_fn(f"==> Exporting standalone binary archive: {out_file.name}")
     proc = subprocess.run(
@@ -1442,7 +1431,7 @@ def build_apk_or_xbps_or_txz_or_tarball(
 
 
 # ---------------------------------------------------------------------------
-# Dependency Inspection & Classification Across All 3 Bases
+# Dependency Inspection & Classification
 # ---------------------------------------------------------------------------
 def read_package_deps(pkg_path: Path) -> list[str]:
     fmt = detect_package_format(pkg_path)
@@ -1658,19 +1647,16 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
     ):
         super().__init__(application=app)
         self.set_title(APP_TITLE)
-        # Fits 1360x766 laptop screens with zero outer page scrolling
         self.set_default_size(1310, 715)
 
         self.host_info = detect_host_distro()
         self.settings = load_settings()
 
-        # Shared / Tab 1 (Native Installer) state
         self.current_pkg: Path | None = None
         self.converted_pkg: Path | None = None
         self.is_busy = False
         self.dep_checkbuttons: dict[str, Gtk.CheckButton] = {}
 
-        # Tab 2 (Universal Converter / Exporter) state
         self.export_src_pkg: Path | None = None
         self.export_out_dir: Path = Path.home()
         self.last_exported_file: Path | None = None
@@ -1736,7 +1722,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
             background-color: #eef0f5;
             color: #1c1c21;
         }
-        /* Paper Folder Notebook Tab Styling */
         window.theme-dark notebook.folder-tabs > header {
             background-color: #121218;
             border-bottom: 2px solid #3584e4;
@@ -1863,7 +1848,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         ver_badge.add_css_class("dim-label")
         header.pack_start(ver_badge)
 
-        # Dark / Light Mode Switcher Button
         self.theme_btn = Gtk.Button(label="☀️ Light")
         self.theme_btn.connect("clicked", self.on_toggle_theme_clicked)
         header.pack_end(self.theme_btn)
@@ -1874,11 +1858,9 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         header.pack_end(update_db_btn)
         self.update_db_btn = update_db_btn
 
-        # Drag-and-drop on entire window
         drop_target = Gtk.DropTarget.new(Gio.File, Gdk_DragAction_COPY())
         drop_target.connect("drop", self.on_file_dropped)
 
-        # Paper Folder Notebook (Switches between Tab 1: Native Installer & Tab 2: Package Exporter)
         self.notebook = Gtk.Notebook()
         self.notebook.add_css_class("folder-tabs")
         self.notebook.set_vexpand(True)
@@ -1886,7 +1868,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         self.notebook.add_controller(drop_target)
         self.set_child(self.notebook)
 
-        # Build Tab 1 & Tab 2 with matching widescreen dashboard layout
         tab1_widget = self._build_installer_tab()
         tab1_label = Gtk.Label(label="📥   Native System Installer")
         self.notebook.append_page(tab1_widget, tab1_label)
@@ -1895,9 +1876,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         tab2_label = Gtk.Label(label="📤   Package Converter / Exporter")
         self.notebook.append_page(tab2_widget, tab2_label)
 
-    # =======================================================================
-    # TAB 1: NATIVE SYSTEM INSTALLER (Widescreen 2-Column Dashboard)
-    # =======================================================================
     def _build_installer_tab(self) -> Gtk.Widget:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         page.set_margin_top(8)
@@ -1907,7 +1885,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         page.set_vexpand(True)
         page.set_hexpand(True)
 
-        # Host Strip
         host_strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         host_strip.add_css_class("host-strip")
         aur_cfg = self.settings.get("aur_helper", "yay")
@@ -1927,7 +1904,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         columns.set_homogeneous(True)
         page.append(columns)
 
-        # --- LEFT COLUMN (Tab 1) ---
         left_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         left_col.set_vexpand(True)
         left_col.set_hexpand(True)
@@ -1990,7 +1966,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
             self.meta_grid.attach(v_lbl, 1, row_idx, 1, 1)
             self.meta_labels[key] = v_lbl
 
-        # Options Card (Tab 1)
         opts_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         opts_card.add_css_class("card-panel")
         opts_card.set_vexpand(True)
@@ -2031,7 +2006,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
             "Double-clicking any package file starts conversion & installation immediately.",
         )
 
-        # Action Bar (Tab 1)
         action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         left_col.append(action_box)
 
@@ -2050,7 +2024,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         send_to_exporter_btn.connect("clicked", lambda _b: self.notebook.set_current_page(1))
         action_box.append(send_to_exporter_btn)
 
-        # --- RIGHT COLUMN (Tab 1) ---
         right_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         right_col.set_vexpand(True)
         right_col.set_hexpand(True)
@@ -2125,9 +2098,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
 
         return page
 
-    # =======================================================================
-    # TAB 2: UNIVERSAL PACKAGE CONVERTER / EXPORTER (Same Outfit & Parts!)
-    # =======================================================================
     def _build_exporter_tab(self) -> Gtk.Widget:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         page.set_margin_top(8)
@@ -2137,7 +2107,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         page.set_vexpand(True)
         page.set_hexpand(True)
 
-        # Exporter Strip
         exp_strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         exp_strip.add_css_class("host-strip")
         exp_lbl = Gtk.Label(xalign=0)
@@ -2155,13 +2124,11 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         columns.set_homogeneous(True)
         page.append(columns)
 
-        # --- LEFT COLUMN (Tab 2: Source Package + Target Format Grid + Export Options + Action Bar) ---
         left_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         left_col.set_vexpand(True)
         left_col.set_hexpand(True)
         columns.append(left_col)
 
-        # 1. Source Package Card (Tab 2)
         src_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         src_card.add_css_class("card-panel")
         left_col.append(src_card)
@@ -2218,7 +2185,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
             self.exp_meta_grid.attach(v_lbl, 1, row_idx, 1, 1)
             self.exp_meta_labels[key] = v_lbl
 
-        # 2. Target Format & Destination Card (Tab 2)
         target_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         target_card.add_css_class("card-panel")
         target_card.set_vexpand(True)
@@ -2228,9 +2194,11 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         tgt_hdr.add_css_class("section-heading")
         target_card.append(tgt_hdr)
 
-        # 2x4 Grid of Target Format Radio Buttons
         fmt_grid = Gtk.Grid(column_spacing=14, row_spacing=4)
-        fmt_grid.set_Column_homogeneous(True) if hasattr(fmt_grid, "set_Column_homogeneous") else fmt_grid.set_column_homogeneous(True)
+        if hasattr(fmt_grid, "set_Column_homogeneous"):
+            fmt_grid.set_Column_homogeneous(True)
+        else:
+            fmt_grid.set_column_homogeneous(True)
         target_card.append(fmt_grid)
 
         saved_fmt = self.settings.get("export_format", "rpm")
@@ -2255,7 +2223,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
             self.export_format_radios[fmt_key] = chk
             fmt_grid.attach(chk, idx % 2, idx // 2, 1, 1)
 
-        # Output Directory Row
         dir_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         dir_row.set_margin_top(4)
         target_card.append(dir_row)
@@ -2273,7 +2240,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         choose_dir_btn.connect("clicked", self.on_choose_export_dir_clicked)
         dir_row.append(choose_dir_btn)
 
-        # Compact Exporter Switches
         self._add_compact_toggle(
             target_card,
             "export_map_deps",
@@ -2287,7 +2253,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
             "Ensures exported .AppImage files run self-contained on any Linux desktop.",
         )
 
-        # 3. Action Bar (Tab 2)
         exp_action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         left_col.append(exp_action_box)
 
@@ -2304,7 +2269,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         self.open_exp_folder_btn.connect("clicked", self.on_open_export_folder_clicked)
         exp_action_box.append(self.open_exp_folder_btn)
 
-        # --- RIGHT COLUMN (Tab 2: Target Dependencies + Export Processing Tracker) ---
         right_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         right_col.set_vexpand(True)
         right_col.set_hexpand(True)
@@ -2340,7 +2304,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         exp_placeholder.add_css_class("dim-label")
         self.exp_deps_list_box.append(exp_placeholder)
 
-        # Bottom-Right Card (Tab 2): Export Processing Tracker & Log
         exp_tracker_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         exp_tracker_card.add_css_class("card-panel")
         exp_tracker_card.set_vexpand(True)
@@ -2402,9 +2365,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         row.append(sw)
         parent.append(row)
 
-    # -----------------------------------------------------------------------
-    # Thread-safe UI updaters for Both Tabs
-    # -----------------------------------------------------------------------
     def append_log(self, text: str, exporter: bool = False):
         def _do():
             buf = self.exp_log_buffer if exporter else self.log_buffer
@@ -2493,9 +2453,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
 
         GLib.idle_add(_do)
 
-    # -----------------------------------------------------------------------
-    # File Loading & Export Directory Picker
-    # -----------------------------------------------------------------------
     def on_file_dropped(self, _target, value, _x, _y) -> bool:
         if isinstance(value, Gio.File):
             path_str = value.get_path()
@@ -2530,9 +2487,7 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
             dialog = Gtk.FileDialog()
             dialog.set_title("Select Linux Package")
             pkg_filter = Gtk.FileFilter()
-            pkg_filter.set_name(
-                "All Supported Linux Packages (.deb, .rpm, .pkg.tar.zst, .AppImage, .apk, .xbps, .txz, .eopkg, .snap, .tar.*)"
-            )
+            pkg_filter.set_name("All Supported Linux Packages")
             for pat in patterns:
                 pkg_filter.add_pattern(pat)
             filters = Gio.ListStore.new(Gtk.FileFilter)
@@ -2606,7 +2561,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         pkg_ver = GLib.markup_escape_text(meta.get("Version", ""))
         markup_title = f"<big><b>{pkg_name}</b></big>  <tt>{pkg_ver}</tt>"
 
-        # Update Tab 1 labels
         self.pkg_title_lbl.set_markup(markup_title)
         self.pkg_sub_lbl.set_text(str(resolved))
         self.meta_labels["Format"].set_text(meta.get("Format", "-"))
@@ -2619,7 +2573,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
             " ".join(meta.get("Description", "-").splitlines())
         )
 
-        # Update Tab 2 labels
         self.exp_title_lbl.set_markup(markup_title)
         self.exp_sub_lbl.set_text(str(resolved))
         self.exp_meta_labels["Format"].set_text(meta.get("Format", "-"))
@@ -2692,9 +2645,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
             f"TRANSLATED '{target_fmt.upper()}' DEPENDENCIES ({len(mapped)} PREVIEWED + ELF SCAN)"
         )
 
-    # -----------------------------------------------------------------------
-    # Subprocess & Root Execution
-    # -----------------------------------------------------------------------
     def _run_streaming_cmd(
         self,
         cmd: list[str],
@@ -2752,9 +2702,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
             return 1
         return self._run_streaming_cmd(cmd)
 
-    # -----------------------------------------------------------------------
-    # Tab 1: Native System Installer Pipeline
-    # -----------------------------------------------------------------------
     def on_update_db_clicked(self, _btn):
         if self.is_busy:
             return
@@ -2974,9 +2921,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    # -----------------------------------------------------------------------
-    # Tab 2: Universal Package Converter / Exporter Pipeline
-    # -----------------------------------------------------------------------
     def on_export_now_clicked(self, _btn):
         if not self.export_src_pkg or self.is_busy:
             return
@@ -3007,7 +2951,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
                         src_file, stage_dir, work_dir, exp_log
                     )
 
-                    # Respect unchecked dependencies in the Exporter preview panel
                     unchecked = {
                         dep
                         for dep, chk in self.export_dep_checks.items()
@@ -3037,7 +2980,6 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
                             f"==> Mapped '{target_fmt}' dependencies: {', '.join(resolved_deps) if resolved_deps else 'none'}"
                         )
 
-                    # Populate Tab 2 dependency list with final resolved dependencies
                     def _update_exp_deps():
                         child = self.exp_deps_list_box.get_first_child()
                         while child is not None:
@@ -3187,6 +3129,69 @@ def main():
             else sys.argv[1]
         )
         sys.exit(run_askpass_dialog(prompt))
+
+    # Native CLI converter interceptor
+    if len(sys.argv) > 1 and sys.argv[1] == "convert":
+        import argparse
+        parser = argparse.ArgumentParser(description="AnyPkg CLI Converter")
+        parser.add_argument("convert", help="Command name")
+        parser.add_argument("source", help="Path to source package")
+        parser.add_argument("--to", required=True, choices=["rpm", "deb", "arch", "appimage", "apk", "xbps", "slackware", "tarball"], help="Target export format")
+        parser.add_argument("-o", "--output", default=".", help="Output directory")
+
+        args = parser.parse_args()
+        source_path = Path(args.source).resolve()
+        output_dir = Path(args.output).resolve()
+
+        if not source_path.exists():
+            print(f"Error: Source file '{source_path}' not found.")
+            sys.exit(1)
+
+        print(f"==> [CLI Mode] Converting {source_path.name} to .{args.to}...")
+
+        def cli_log(msg):
+            print(msg)
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="anypkg-cli-") as tmpdir:
+                work_dir = Path(tmpdir)
+                stage_dir = work_dir / "stage"
+                stage_dir.mkdir(parents=True, exist_ok=True)
+
+                cli_log("==> Extracting source package...")
+                meta, extra_deps = extract_any_to_stage(
+                    source_path, stage_dir, work_dir, cli_log
+                )
+
+                pkgname = meta.get("Package", source_path.stem)
+                pkgver = meta.get("Version", "1.0.0")
+                pkgdesc = meta.get("Description", f"Converted from {source_path.name}")
+                resolved_deps = []
+
+                cli_log(f"==> Building target .{args.to} package...")
+                output_dir.mkdir(parents=True, exist_ok=True)
+                built_file = None
+
+                if args.to == "deb":
+                    built_file = build_deb_pkg_from_stage(stage_dir, pkgname, pkgver, pkgdesc, resolved_deps, output_dir, cli_log)
+                elif args.to == "rpm":
+                    built_file = build_rpm_pkg_from_stage(stage_dir, pkgname, pkgver, pkgdesc, resolved_deps, output_dir, cli_log)
+                elif args.to == "arch":
+                    built_file = build_arch_pkg_from_stage(stage_dir, pkgname, pkgver, pkgdesc, resolved_deps, output_dir, cli_log)
+                elif args.to == "appimage":
+                    built_file = build_appimage_from_stage(stage_dir, pkgname, pkgver, pkgdesc, output_dir, cli_log)
+                else:
+                    built_file = build_apk_or_xbps_or_txz_or_tarball(args.to, stage_dir, pkgname, pkgver, pkgdesc, resolved_deps, output_dir, cli_log)
+
+                if built_file and built_file.exists():
+                    print(f"==> ✓ Success! Output file: {built_file}")
+                    sys.exit(0)
+                else:
+                    print("Error: Package building failed.")
+                    sys.exit(1)
+        except Exception as e:
+            print(f"Error during CLI conversion: {e}")
+            sys.exit(1)
 
     auto_run = False
     pkg_arg: Path | None = None
