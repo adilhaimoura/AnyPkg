@@ -1,13 +1,26 @@
 #!/usr/bin/env python3
 """
-AnyPkg v1.0.0.2 — Universal Native Linux Package Installer & Cross-Format Exporter
+AnyPkg v1.1.0 — Universal Native Linux Package Installer & Cross-Format Exporter
 Features a dual Paper-Folder Tab Widescreen Dashboard (1310x710 for 1360x766 laptops):
   • Tab 1: [📥 Native System Installer] — One-click native install into your host distro
            (Debian/Ubuntu/Mint .deb, Fedora/openSUSE .rpm, or Arch/Manjaro .pkg.tar.zst)
   • Tab 2: [📤 Package Converter / Exporter] — Convert & export between Linux package formats
            (.deb ⇄ .rpm ⇄ .AppImage ⇄ .pkg.tar.zst ⇄ .apk ⇄ .xbps ⇄ .txz ⇄ .tar.zst)
+           with BULK export: multi-select files, multi-file drag & drop, or open a folder
+  • Headless CLI (new in v1.1.0): `anypkg convert SOURCE... --to FORMAT [-o DIR] [--pattern GLOB]`
+           bulk inputs: files, folders (top level only, one source type per run) or globs;
+           `--to native` = this machine's distro format (auto-detected)
+
+Credits: the original `convert` CLI subcommand idea came from the fork by
+         @Coding-01 (https://github.com/Coding-01) — v1.1.0 keeps it and extends it
+         with proper --help/--version, bulk inputs and dependency mapping. Thank you!
 """
 
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import glob
 import json
 import os
 import plistlib
@@ -23,22 +36,36 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import gi
-
-gi.require_version("Gtk", "4.0")
-from gi.repository import Gio, GLib, Gtk, Pango
-
+# GTK / PyGObject are only needed for the graphical dashboard. The CLI
+# (`anypkg convert …`) must also work on headless machines without GTK,
+# so the gi import is optional and HAS_GUI tells main() if the GUI can launch.
 try:
-    gi.require_version("Adw", "1")
-    from gi.repository import Adw
+    import gi
 
-    HAS_ADW = True
-except (ValueError, ImportError):
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import Gio, GLib, Gtk, Pango
+
+    try:
+        gi.require_version("Adw", "1")
+        from gi.repository import Adw
+
+        HAS_ADW = True
+    except (ValueError, ImportError):
+        HAS_ADW = False
+
+    HAS_GUI = True
+    _WINDOW_BASE = Gtk.ApplicationWindow  # base class of AnyPkgWindow
+    _APP_BASE = Gtk.Application  # base class of AnyPkgApp
+except Exception:
+    # No PyGObject / GTK4 available -> CLI-only mode (GUI classes fall back to object)
+    HAS_GUI = False
     HAS_ADW = False
+    _WINDOW_BASE = object
+    _APP_BASE = object
 
 
 APP_ID = "org.anypkg.installer"
-APP_VERSION = "1.0.0.2"
+APP_VERSION = "1.1.0"
 APP_TITLE = f"AnyPkg v{APP_VERSION} — Universal Linux Package Installer & Exporter"
 CONFIG_DIR = Path.home() / ".config" / "anypkg"
 CONFIG_FILE = CONFIG_DIR / "settings.json"
@@ -150,6 +177,27 @@ EXPORT_FORMATS = [
     ("xbps", "🌌  Void Linux (.xbps)", ".xbps"),
     ("slackware", "💿  Slackware (.txz)", ".txz"),
     ("tarball", "📁  Standalone Binary Tarball (.tar.zst)", ".tar.zst"),
+]
+
+# File-dialog glob patterns for every supported input package type
+PKG_FILE_PATTERNS = [
+    "*.deb",
+    "*.rpm",
+    "*.AppImage",
+    "*.appimage",
+    "*.apk",
+    "*.xbps",
+    "*.txz",
+    "*.tgz",
+    "*.tlz",
+    "*.eopkg",
+    "*.snap",
+    "*.tar.gz",
+    "*.tar.xz",
+    "*.tar.zst",
+    "*.tar.bz2",
+    "*.pkg.tar.zst",
+    "*.pkg.tar.xz",
 ]
 
 
@@ -1650,9 +1698,9 @@ def is_debtap_initialized() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Main Widescreen Window with Paper-Folder Tabs (v1.0.0.2)
+# Main Widescreen Window with Paper-Folder Tabs (v1.1.0)
 # ---------------------------------------------------------------------------
-class AnyPkgWindow(Gtk.ApplicationWindow):
+class AnyPkgWindow(_WINDOW_BASE):
     def __init__(
         self, app: Gtk.Application, initial_pkg: Path | None = None, auto_run: bool = False
     ):
@@ -1676,6 +1724,7 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         self.last_exported_file: Path | None = None
         self.export_dep_checks: dict[str, Gtk.CheckButton] = {}
         self.export_format_radios: dict[str, Gtk.CheckButton] = {}
+        self.export_queue: list[Path] = []  # bulk export queue (Tab 2 multi-select / folder / multi-drop)
 
         self._apply_css()
         self._build_ui()
@@ -1874,9 +1923,16 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         header.pack_end(update_db_btn)
         self.update_db_btn = update_db_btn
 
-        # Drag-and-drop on entire window
+        # Drag-and-drop on entire window (single file)
         drop_target = Gtk.DropTarget.new(Gio.File, Gdk_DragAction_COPY())
         drop_target.connect("drop", self.on_file_dropped)
+
+        # Multi-file drag-and-drop arrives as a Gdk.FileList -> bulk export queue (Tab 2)
+        gi.require_version("Gdk", "4.0")
+        from gi.repository import Gdk
+
+        list_target = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        list_target.connect("drop", self.on_file_list_dropped)
 
         # Paper Folder Notebook (Switches between Tab 1: Native Installer & Tab 2: Package Exporter)
         self.notebook = Gtk.Notebook()
@@ -1884,6 +1940,7 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         self.notebook.set_vexpand(True)
         self.notebook.set_hexpand(True)
         self.notebook.add_controller(drop_target)
+        self.notebook.add_controller(list_target)
         self.set_child(self.notebook)
 
         # Build Tab 1 & Tab 2 with matching widescreen dashboard layout
@@ -2192,10 +2249,17 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         self.exp_sub_lbl.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
         title_col.append(self.exp_sub_lbl)
 
-        browse_btn = Gtk.Button(label="Browse…")
+        browse_btn = Gtk.Button(label="Browse Files…")
         browse_btn.set_valign(Gtk.Align.CENTER)
-        browse_btn.connect("clicked", self.on_open_clicked)
+        browse_btn.set_tooltip_text("Select one or more package files (bulk export)")
+        browse_btn.connect("clicked", self.on_open_multi_clicked)
         top_row.append(browse_btn)
+
+        folder_btn = Gtk.Button(label="Open Folder…")
+        folder_btn.set_valign(Gtk.Align.CENTER)
+        folder_btn.set_tooltip_text("Queue every supported package in a folder (top level only)")
+        folder_btn.connect("clicked", self.on_open_folder_clicked)
+        top_row.append(folder_btn)
 
         self.exp_meta_grid = Gtk.Grid(column_spacing=12, row_spacing=3)
         src_card.append(self.exp_meta_grid)
@@ -2433,7 +2497,9 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
             self.is_busy = busy
             has_file = self.current_pkg is not None
             self.convert_install_btn.set_sensitive(has_file and not busy)
-            self.export_now_btn.set_sensitive((self.export_src_pkg is not None) and not busy)
+            self.export_now_btn.set_sensitive(
+                ((self.export_src_pkg is not None) or bool(self.export_queue)) and not busy
+            )
             self.update_db_btn.set_sensitive(not busy)
             return False
 
@@ -2506,26 +2572,29 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
                     return True
         return False
 
+    def on_file_list_dropped(self, _target, value, _x, _y) -> bool:
+        """Multi-file drop (Gdk.FileList): 1 file -> classic load, N files -> bulk export queue."""
+        try:
+            gfiles = value.get_files()
+        except Exception:
+            return False
+        paths = []
+        for f in gfiles:
+            path_str = f.get_path()
+            if path_str:
+                p = Path(path_str)
+                if p.exists() and detect_package_format(p) != "unknown":
+                    paths.append(p)
+        if not paths:
+            return False
+        if len(paths) == 1:
+            self.load_package_both_tabs(paths[0])
+        else:
+            self.load_export_queue(paths)
+        return True
+
     def on_open_clicked(self, _btn):
-        patterns = [
-            "*.deb",
-            "*.rpm",
-            "*.AppImage",
-            "*.appimage",
-            "*.apk",
-            "*.xbps",
-            "*.txz",
-            "*.tgz",
-            "*.tlz",
-            "*.eopkg",
-            "*.snap",
-            "*.tar.gz",
-            "*.tar.xz",
-            "*.tar.zst",
-            "*.tar.bz2",
-            "*.pkg.tar.zst",
-            "*.pkg.tar.xz",
-        ]
+        patterns = PKG_FILE_PATTERNS
         if hasattr(Gtk, "FileDialog"):
             dialog = Gtk.FileDialog()
             dialog.set_title("Select Linux Package")
@@ -2571,6 +2640,146 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
             native.connect("response", on_resp)
             native.show()
 
+    def _make_pkg_filter(self) -> Gtk.FileFilter:
+        pkg_filter = Gtk.FileFilter()
+        pkg_filter.set_name(
+            "All Supported Linux Packages (.deb, .rpm, .pkg.tar.zst, .AppImage, .apk, .xbps, .txz, .eopkg, .snap, .tar.*)"
+        )
+        for pat in PKG_FILE_PATTERNS:
+            pkg_filter.add_pattern(pat)
+        return pkg_filter
+
+    def on_open_multi_clicked(self, _btn):
+        """Tab 2 (Exporter) file picker with multi-select -> bulk export queue."""
+        if hasattr(Gtk, "FileDialog"):
+            dialog = Gtk.FileDialog()
+            dialog.set_title("Select Linux Package(s)")
+            filters = Gio.ListStore.new(Gtk.FileFilter)
+            filters.append(self._make_pkg_filter())
+            dialog.set_filters(filters)
+
+            def on_open_multi_finish(dlg, res):
+                try:
+                    gfiles = dlg.open_multiple_finish(res)
+                    paths = [Path(f.get_path()) for f in gfiles if f and f.get_path()] if gfiles else []
+                    if paths:
+                        self.load_export_queue(paths)
+                except Exception:
+                    pass
+
+            dialog.open_multiple(self, None, on_open_multi_finish)
+        else:
+            native = Gtk.FileChooserNative.new(
+                "Select Linux Package(s)",
+                self,
+                Gtk.FileChooserAction.OPEN,
+                "_Open",
+                "_Cancel",
+            )
+            native.add_filter(self._make_pkg_filter())
+            native.set_select_multiple(True)
+
+            def on_resp(dlg, response):
+                if response == Gtk.ResponseType.ACCEPT:
+                    paths = [Path(f.get_path()) for f in dlg.get_files() if f.get_path()]
+                    if paths:
+                        self.load_export_queue(paths)
+
+            native.connect("response", on_resp)
+            native.show()
+
+    def on_open_folder_clicked(self, _btn):
+        """Tab 2 (Exporter): queue every supported package in a folder (top level only)."""
+        if hasattr(Gtk, "FileDialog"):
+            dialog = Gtk.FileDialog()
+            dialog.set_title("Select Folder of Packages")
+
+            def on_folder_finish(dlg, res):
+                try:
+                    gfile = dlg.select_folder_finish(res)
+                    if gfile and gfile.get_path():
+                        self.load_export_folder(Path(gfile.get_path()))
+                except Exception:
+                    pass
+
+            dialog.select_folder(self, None, on_folder_finish)
+        else:
+            native = Gtk.FileChooserNative.new(
+                "Select Folder of Packages",
+                self,
+                Gtk.FileChooserAction.SELECT_FOLDER,
+                "_Open",
+                "_Cancel",
+            )
+
+            def on_resp(dlg, response):
+                if response == Gtk.ResponseType.ACCEPT:
+                    gfile = dlg.get_file()
+                    if gfile and gfile.get_path():
+                        self.load_export_folder(Path(gfile.get_path()))
+
+            native.connect("response", on_resp)
+            native.show()
+
+    def load_export_folder(self, folder: Path):
+        """Queue all supported package files directly inside `folder` (no recursion)."""
+        if not folder.is_dir():
+            return
+        paths = [
+            p
+            for p in sorted(folder.iterdir())
+            if p.is_file() and detect_package_format(p) != "unknown"
+        ]
+        if not paths:
+            self.append_log(f"No supported packages found in {folder}", exporter=True)
+            return
+        self.load_export_queue(paths)
+
+    def load_export_queue(self, paths: list[Path]):
+        """
+        Tab 2 bulk mode: queue several packages for export.
+        A single file keeps the classic single-package behavior (both tabs updated).
+        The Installer tab (Tab 1) always stays single-file.
+        """
+        paths = [p.resolve() for p in paths if p.exists()]
+        if not paths:
+            return
+        if len(paths) == 1:
+            self.load_package_both_tabs(paths[0])
+            return
+
+        self.export_queue = paths
+        self.export_src_pkg = paths[0]  # used for the metadata preview panel
+        self.export_out_dir = paths[0].parent
+        self.exp_dir_entry.set_text(str(self.export_out_dir))
+        self.converted_pkg = None
+
+        n = len(paths)
+        fmts = {detect_package_format(p) for p in paths}
+        first_meta = parse_package_metadata(paths[0])
+        first_name = GLib.markup_escape_text(first_meta.get("Package", paths[0].stem))
+        self.exp_title_lbl.set_markup(
+            f"<big><b>{n} packages queued</b></big>  <tt>({first_name} …)</tt>"
+        )
+        shown = ", ".join(p.name for p in paths[:6])
+        if n > 6:
+            shown += " …"
+        self.exp_sub_lbl.set_text(shown)
+        if len(fmts) > 1:
+            fmt_label = "Mixed: " + ", ".join(sorted(FORMAT_LABELS.get(f, f) for f in fmts))
+        else:
+            fmt_label = FORMAT_LABELS.get(next(iter(fmts)), "-")
+        self.exp_meta_labels["Format"].set_text(fmt_label)
+        self.exp_meta_labels["Version"].set_text(f"{n} files")
+        self.exp_meta_labels["Installed-Size"].set_text("—")
+        self.exp_meta_labels["Description"].set_text(
+            f"Ready to export all {n} packages to '{self.settings.get('export_format', 'rpm')}'."
+        )
+        self.export_now_btn.set_sensitive(not self.is_busy)
+        self.set_progress(0.0, f"{n} packages queued — ready to export.", exporter=True)
+        self.append_log(f"Queued {n} package(s) for bulk export: {shown}", exporter=True)
+        self._preview_export_dependencies()
+
     def on_choose_export_dir_clicked(self, _btn):
         if hasattr(Gtk, "FileDialog"):
             dialog = Gtk.FileDialog()
@@ -2598,6 +2807,8 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         self.export_out_dir = resolved.parent
         self.exp_dir_entry.set_text(str(self.export_out_dir))
         self.converted_pkg = None
+        self.export_queue = []  # single-file load clears any bulk export queue
+        self.export_queue = []  # single-file load clears any bulk export queue
 
         fmt = detect_package_format(resolved)
         meta = parse_package_metadata(resolved)
@@ -2978,148 +3189,101 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
     # Tab 2: Universal Package Converter / Exporter Pipeline
     # -----------------------------------------------------------------------
     def on_export_now_clicked(self, _btn):
-        if not self.export_src_pkg or self.is_busy:
+        sources = (
+            list(self.export_queue)
+            if self.export_queue
+            else ([self.export_src_pkg] if self.export_src_pkg else [])
+        )
+        if not sources or self.is_busy:
             return
         self.set_busy(True)
 
         def exp_log(msg: str):
             self.append_log(msg, exporter=True)
 
-        def worker():
-            try:
-                src_file = self.export_src_pkg
-                assert src_file is not None
-                src_fmt = detect_package_format(src_file)
-                target_fmt = self.settings.get("export_format", "rpm")
+        def show_exported_deps(deps: list[str], target_fmt: str):
+            """Refresh the Tab 2 dependency checklist with one file's resolved deps."""
 
-                self.set_progress(
-                    0.15,
-                    f"Extracting {src_file.name} ({src_fmt}) for '{target_fmt}' export…",
-                    exporter=True,
+            def _do():
+                child = self.exp_deps_list_box.get_first_child()
+                while child is not None:
+                    nxt = child.get_next_sibling()
+                    self.exp_deps_list_box.remove(child)
+                    child = nxt
+                self.export_dep_checks.clear()
+                for d in deps:
+                    row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                    chk = Gtk.CheckButton(label=d)
+                    chk.set_active(True)
+                    chk.set_hexpand(True)
+                    self.export_dep_checks[d] = chk
+                    badge = Gtk.Label(label=f"Exported ({target_fmt})")
+                    badge.add_css_class("badge-installed")
+                    row.append(chk)
+                    row.append(badge)
+                    self.exp_deps_list_box.append(row)
+                self.exp_deps_hdr_lbl.set_text(
+                    f"TRANSLATED '{target_fmt.upper()}' DEPENDENCIES ({len(deps)})"
                 )
+                return False
 
-                with tempfile.TemporaryDirectory(prefix="anypkg-export-") as tmpdir:
-                    work_dir = Path(tmpdir)
-                    stage_dir = work_dir / "stage"
-                    stage_dir.mkdir(parents=True, exist_ok=True)
+            GLib.idle_add(_do)
 
-                    meta, extra_deps = extract_any_to_stage(
-                        src_file, stage_dir, work_dir, exp_log
+        def worker():
+            target_fmt = self.settings.get("export_format", "rpm")
+            # Respect unchecked dependencies in the Exporter preview panel (single-file mode)
+            unchecked = {
+                dep for dep, chk in self.export_dep_checks.items() if not chk.get_active()
+            }
+            map_deps = bool(self.settings.get("export_map_deps", True))
+            total = len(sources)
+            succeeded: list[Path] = []
+            failed: list[tuple[Path, str]] = []
+            try:
+                for idx, src_file in enumerate(sources, 1):
+                    exp_log(
+                        f"\n===== [{idx}/{total}] {src_file.name} "
+                        f"({detect_package_format(src_file)}) -> {target_fmt} ====="
                     )
-
-                    # Respect unchecked dependencies in the Exporter preview panel
-                    unchecked = {
-                        dep
-                        for dep, chk in self.export_dep_checks.items()
-                        if not chk.get_active()
-                    }
-
-                    resolved_deps = []
-                    if self.settings.get("export_map_deps", True) and target_fmt not in (
-                        "appimage",
-                        "tarball",
-                        "slackware",
-                    ):
-                        self.set_progress(
-                            0.45,
-                            f"Scanning ELF binaries & mapping '{target_fmt}' dependencies…",
-                            exporter=True,
-                        )
-                        needed_sonames = scan_elf_needed_sonames(stage_dir, exp_log)
-                        resolved_deps = [
-                            d
-                            for d in resolve_dependencies_for_target(
-                                target_fmt, needed_sonames, extra_deps
-                            )
-                            if d not in unchecked
-                        ]
-                        exp_log(
-                            f"==> Mapped '{target_fmt}' dependencies: {', '.join(resolved_deps) if resolved_deps else 'none'}"
-                        )
-
-                    # Populate Tab 2 dependency list with final resolved dependencies
-                    def _update_exp_deps():
-                        child = self.exp_deps_list_box.get_first_child()
-                        while child is not None:
-                            nxt = child.get_next_sibling()
-                            self.exp_deps_list_box.remove(child)
-                            child = nxt
-                        self.export_dep_checks.clear()
-                        for d in resolved_deps:
-                            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-                            chk = Gtk.CheckButton(label=d)
-                            chk.set_active(True)
-                            chk.set_hexpand(True)
-                            self.export_dep_checks[d] = chk
-                            badge = Gtk.Label(label=f"Exported ({target_fmt})")
-                            badge.add_css_class("badge-installed")
-                            row.append(chk)
-                            row.append(badge)
-                            self.exp_deps_list_box.append(row)
-                        self.exp_deps_hdr_lbl.set_text(
-                            f"TRANSLATED '{target_fmt.upper()}' DEPENDENCIES ({len(resolved_deps)})"
-                        )
-                        return False
-
-                    GLib.idle_add(_update_exp_deps)
-
-                    pkgname = meta.get("Package", src_file.stem)
-                    pkgver = meta.get("Version", "1.0.0")
-                    pkgdesc = meta.get("Description", f"Exported from {src_file.name}")
-
                     self.set_progress(
-                        0.70,
-                        f"Building target '{target_fmt}' package…",
+                        (idx - 1) / total,
+                        f"[{idx}/{total}] {src_file.name} -> .{target_fmt}",
                         exporter=True,
                     )
-
-                    built_file: Path | None = None
-                    if target_fmt == "deb":
-                        built_file = build_deb_pkg_from_stage(
-                            stage_dir, pkgname, pkgver, pkgdesc, resolved_deps, work_dir, exp_log
-                        )
-                    elif target_fmt == "rpm":
-                        built_file = build_rpm_pkg_from_stage(
-                            stage_dir, pkgname, pkgver, pkgdesc, resolved_deps, work_dir, exp_log
-                        )
-                    elif target_fmt == "arch":
-                        built_file = build_arch_pkg_from_stage(
-                            stage_dir, pkgname, pkgver, pkgdesc, resolved_deps, work_dir, exp_log
-                        )
-                    elif target_fmt == "appimage":
-                        built_file = build_appimage_from_stage(
-                            stage_dir, pkgname, pkgver, pkgdesc, work_dir, exp_log
-                        )
-                    else:
-                        built_file = build_apk_or_xbps_or_txz_or_tarball(
+                    try:
+                        result = convert_one_package(
+                            src_file,
                             target_fmt,
-                            stage_dir,
-                            pkgname,
-                            pkgver,
-                            pkgdesc,
-                            resolved_deps,
-                            work_dir,
+                            self.export_out_dir,
                             exp_log,
+                            map_deps=map_deps,
+                            exclude_deps=unchecked if total == 1 else None,
                         )
+                        if result:
+                            succeeded.append(result["out"])
+                            self.last_exported_file = result["out"]
+                            exp_log(f"==> ✓ [{idx}/{total}] exported: {result['out']}")
+                            show_exported_deps(result["deps"], target_fmt)
+                        else:
+                            failed.append((src_file, "builder produced no output file"))
+                            exp_log(f"==> ✗ [{idx}/{total}] {src_file.name}: export failed — see log above")
+                    except Exception as exc:
+                        failed.append((src_file, str(exc)))
+                        exp_log(f"==> ✗ [{idx}/{total}] {src_file.name}: {exc}")
 
-                    if not built_file or not built_file.exists():
-                        self.set_progress(
-                            0.0,
-                            f"Export to '{target_fmt}' failed. Check log below.",
-                            exporter=True,
-                        )
-                        return
-
-                    self.export_out_dir.mkdir(parents=True, exist_ok=True)
-                    final_dest = self.export_out_dir / built_file.name
-                    shutil.copy2(built_file, final_dest)
-                    self.last_exported_file = final_dest
-                    exp_log(f"==> ✓ Successfully exported package to: {final_dest}")
+                if failed:
                     self.set_progress(
-                        1.0,
-                        f"✓ Exported: {final_dest.name}",
+                        len(succeeded) / total,
+                        f"Exported {len(succeeded)}/{total} — {len(failed)} failed",
                         exporter=True,
                     )
+                else:
+                    self.set_progress(1.0, f"✓ Exported all {total} package(s)", exporter=True)
+                exp_log(
+                    f"\n==> Bulk export finished: {len(succeeded)}/{total} succeeded -> {self.export_out_dir}"
+                )
+                for p, reason in failed:
+                    exp_log(f"    ✗ {p.name} — {reason}")
             except Exception as exc:
                 exp_log(f"Export error: {exc}")
                 self.set_progress(0.0, f"Export error: {exc}", exporter=True)
@@ -3129,6 +3293,282 @@ class AnyPkgWindow(Gtk.ApplicationWindow):
         threading.Thread(target=worker, daemon=True).start()
 
 
+# ---------------------------------------------------------------------------
+# Shared Conversion Engine — one pipeline used by the GUI Exporter tab
+# (single file AND bulk queue) and by the headless CLI (`anypkg convert …`)
+# ---------------------------------------------------------------------------
+def build_package_for_format(
+    target_fmt: str,
+    stage_dir: Path,
+    pkgname: str,
+    pkgver: str,
+    pkgdesc: str,
+    depends: list[str],
+    output_dir: Path,
+    log_fn,
+) -> Path | None:
+    """Dispatch to the correct builder for `target_fmt`."""
+    if target_fmt == "deb":
+        return build_deb_pkg_from_stage(stage_dir, pkgname, pkgver, pkgdesc, depends, output_dir, log_fn)
+    if target_fmt == "rpm":
+        return build_rpm_pkg_from_stage(stage_dir, pkgname, pkgver, pkgdesc, depends, output_dir, log_fn)
+    if target_fmt == "arch":
+        return build_arch_pkg_from_stage(stage_dir, pkgname, pkgver, pkgdesc, depends, output_dir, log_fn)
+    if target_fmt == "appimage":
+        return build_appimage_from_stage(stage_dir, pkgname, pkgver, pkgdesc, output_dir, log_fn)
+    return build_apk_or_xbps_or_txz_or_tarball(
+        target_fmt, stage_dir, pkgname, pkgver, pkgdesc, depends, output_dir, log_fn
+    )
+
+
+def convert_one_package(
+    src_path: Path,
+    target_fmt: str,
+    output_dir: Path,
+    log_fn,
+    map_deps: bool = True,
+    exclude_deps: set[str] | None = None,
+) -> dict | None:
+    """
+    Convert a single package file into `target_fmt`, written into `output_dir`.
+
+    Returns {"out": Path, "deps": [...], "meta": {...}} on success, None on failure.
+    Shared by the GUI Exporter tab (single & bulk) and the CLI so behavior never drifts.
+    """
+    src_path = Path(src_path)
+    output_dir = Path(output_dir)
+    with tempfile.TemporaryDirectory(prefix="anypkg-conv-") as tmpdir:
+        work_dir = Path(tmpdir)
+        stage_dir = work_dir / "stage"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+
+        meta, extra_deps = extract_any_to_stage(src_path, stage_dir, work_dir, log_fn)
+
+        resolved_deps: list[str] = []
+        if map_deps and target_fmt not in ("appimage", "tarball", "slackware"):
+            needed_sonames = scan_elf_needed_sonames(stage_dir, log_fn)
+            resolved_deps = resolve_dependencies_for_target(target_fmt, needed_sonames, extra_deps)
+            if resolved_deps:
+                log_fn(f"==> Mapped '{target_fmt}' dependencies: {', '.join(resolved_deps)}")
+        if exclude_deps:
+            resolved_deps = [d for d in resolved_deps if d not in exclude_deps]
+
+        pkgname = meta.get("Package", src_path.stem)
+        pkgver = meta.get("Version", "1.0.0")
+        pkgdesc = meta.get("Description", f"Converted from {src_path.name}")
+
+        build_out = work_dir / "out"
+        build_out.mkdir(parents=True, exist_ok=True)
+        built_file = build_package_for_format(
+            target_fmt, stage_dir, pkgname, pkgver, pkgdesc, resolved_deps, build_out, log_fn
+        )
+        if not built_file or not built_file.exists():
+            return None
+
+        # Copy into the final output dir, never overwriting an existing file (bulk collisions)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ext = next((e for k, _label, e in EXPORT_FORMATS if k == target_fmt), "")
+        if ext and built_file.name.endswith(ext):
+            base_name = built_file.name[: -len(ext)]
+        else:
+            base_name, ext = built_file.stem, built_file.suffix
+        dest = output_dir / built_file.name
+        counter = 2
+        while dest.exists():
+            dest = output_dir / f"{base_name}-{counter}{ext}"
+            counter += 1
+        shutil.copy2(built_file, dest)
+        return {"out": dest, "deps": resolved_deps, "meta": meta}
+
+
+# ---------------------------------------------------------------------------
+# Headless CLI (new in v1.1.0): `anypkg convert SOURCE... --to FORMAT [-o DIR]`
+# The original single-file `convert` subcommand idea came from the fork by
+# @Coding-01 (https://github.com/Coding-01); v1.1.0 keeps it and extends it with
+# top-level --help/--version, bulk inputs (files / folders / globs), --to native,
+# and dependency mapping via the shared engine above.
+# ---------------------------------------------------------------------------
+class CliError(Exception):
+    """User-facing CLI input error (reported without a traceback)."""
+
+
+def _scan_folder_top_level(folder: Path, pattern: str | None) -> list[Path]:
+    """Supported package files directly inside `folder` (no recursion), optionally filtered by `pattern`."""
+    out: list[Path] = []
+    for p in sorted(folder.iterdir()):
+        if not p.is_file() or detect_package_format(p) == "unknown":
+            continue
+        if pattern and not fnmatch.fnmatch(p.name, pattern):
+            continue
+        out.append(p)
+    return out
+
+
+def expand_cli_sources(sources: list[str], pattern: str | None) -> list[Path]:
+    """
+    Expand CLI SOURCE arguments into a concrete list of package files.
+
+    Each SOURCE may be:
+      • a package file             -> used as-is
+      • a folder                   -> top level only (no recursion), filtered to supported
+                                      package files (plus --pattern if given)
+      • a glob pattern (*, ?, [)   -> expanded with glob rules
+
+    Folder inputs holding mixed package formats are rejected unless --pattern picks
+    a single type: one source type at a time, one target format per run.
+    """
+    files: list[Path] = []
+    dir_files: list[Path] = []
+    for raw in sources:
+        if any(c in raw for c in "*?["):
+            matches = sorted(glob.glob(raw))
+            if not matches:
+                raise CliError(f"pattern matched nothing: {raw!r}")
+            for m in matches:
+                p = Path(m)
+                if p.is_dir():
+                    dir_files.extend(_scan_folder_top_level(p, pattern))
+                elif p.is_file():
+                    if detect_package_format(p) == "unknown":
+                        raise CliError(f"not a supported package file: {p}")
+                    files.append(p)
+                else:
+                    raise CliError(f"no such file or folder: {p}")
+        elif os.path.isdir(raw):
+            dir_files.extend(_scan_folder_top_level(Path(raw), pattern))
+        elif os.path.isfile(raw):
+            p = Path(raw)
+            if detect_package_format(p) == "unknown":
+                raise CliError(f"not a supported package file: {p}")
+            files.append(p)
+        else:
+            raise CliError(f"no such file or folder: {raw}")
+
+    if pattern is None and dir_files:
+        fmts = {detect_package_format(p) for p in dir_files}
+        if len(fmts) > 1:
+            raise CliError(
+                "folder input contains mixed package formats ("
+                + ", ".join(sorted(fmts))
+                + "). Convert one source type at a time — re-run with e.g. --pattern '*.deb'."
+            )
+
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for p in files + dir_files:
+        r = p.resolve()
+        if r not in seen:
+            seen.add(r)
+            ordered.append(p)
+    return ordered
+
+
+def build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="anypkg",
+        description=(
+            f"AnyPkg v{APP_VERSION} — Universal Native Linux Package Installer & Cross-Format Exporter.\n"
+            "Run without arguments to open the graphical dashboard; use a subcommand for headless CLI use."
+        ),
+        epilog=(
+            "examples:\n"
+            "  anypkg convert ./app.deb --to rpm -o ./out\n"
+            "  anypkg convert ./downloads --to native --pattern '*.deb'\n"
+            "  anypkg convert a.deb b.rpm c.AppImage --to appimage\n"
+            "  anypkg convert '*.pkg.tar.zst' --to deb -o ./converted\n"
+            "\n"
+            "Run 'anypkg convert --help' for all convert options."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--version", action="version", version=f"AnyPkg v{APP_VERSION}")
+    sub = parser.add_subparsers(dest="command", metavar="command")
+    conv = sub.add_parser(
+        "convert",
+        help="convert one or more packages to a target format (bulk supported)",
+        description=(
+            "Convert package file(s), folder(s) or glob(s) into one target format. "
+            "Folders are scanned top level only; use --pattern to pick one source type."
+        ),
+        epilog=(
+            "examples:\n"
+            "  anypkg convert ./app.deb --to rpm\n"
+            "  anypkg convert ./downloads --to native --pattern '*.deb' -o ./out\n"
+            "  anypkg convert a.deb b.rpm --to appimage --no-map-deps"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    conv.add_argument(
+        "sources",
+        nargs="+",
+        metavar="SOURCE",
+        help="package file(s), folder(s) (top level only), or glob pattern(s)",
+    )
+    conv.add_argument(
+        "--to",
+        required=True,
+        dest="to",
+        choices=[k for k, _label, _ext in EXPORT_FORMATS] + ["native"],
+        help="target format; 'native' = this machine's distro format (auto-detected)",
+    )
+    conv.add_argument(
+        "-o", "--output", default=".", help="output directory (default: current directory)"
+    )
+    conv.add_argument(
+        "--pattern",
+        default=None,
+        metavar="GLOB",
+        help="only include files whose name matches GLOB, e.g. '*.deb'",
+    )
+    conv.add_argument(
+        "--no-map-deps",
+        action="store_true",
+        help="skip the ELF scan / dependency mapping written into the exported package",
+    )
+    return parser
+
+
+def run_convert_cli(args: argparse.Namespace) -> int:
+    target_fmt = args.to
+    if target_fmt == "native":
+        target_fmt = detect_host_distro()["base"]
+        print(f"==> Host distro detected — native target format: {target_fmt}")
+    output_dir = Path(args.output).resolve()
+    try:
+        sources = expand_cli_sources(args.sources, args.pattern)
+    except CliError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not sources:
+        print("error: no supported package files found in the given source(s).", file=sys.stderr)
+        return 2
+
+    total = len(sources)
+    print(f"==> AnyPkg v{APP_VERSION} bulk convert: {total} file(s) -> .{target_fmt} -> {output_dir}")
+    succeeded: list[Path] = []
+    failed: list[tuple[Path, str]] = []
+    for idx, src in enumerate(sources, 1):
+        print(f"\n===== [{idx}/{total}] {src.name} ({detect_package_format(src)}) -> {target_fmt} =====")
+        try:
+            result = convert_one_package(src, target_fmt, output_dir, print, map_deps=not args.no_map_deps)
+            if result:
+                succeeded.append(result["out"])
+                print(f"==> ✓ [{idx}/{total}] {result['out']}")
+            else:
+                failed.append((src, "builder produced no output file"))
+                print(f"==> ✗ [{idx}/{total}] {src.name}: build failed (see messages above)")
+        except Exception as exc:
+            failed.append((src, str(exc)))
+            print(f"==> ✗ [{idx}/{total}] {src.name}: {exc}")
+
+    print(f"\n==> Summary: {len(succeeded)}/{total} converted -> {output_dir}")
+    for p in succeeded:
+        print(f"    ✓ {p.name}")
+    for p, reason in failed:
+        print(f"    ✗ {p.name} — {reason}")
+    return 0 if not failed else 1
+
+
 def Gdk_DragAction_COPY():
     gi.require_version("Gdk", "4.0")
     from gi.repository import Gdk
@@ -3136,7 +3576,7 @@ def Gdk_DragAction_COPY():
     return Gdk.DragAction.COPY
 
 
-class AnyPkgApp(Gtk.Application):
+class AnyPkgApp(_APP_BASE):
     def __init__(self, initial_pkg: Path | None = None, auto_run: bool = False):
         super().__init__(
             application_id=APP_ID,
@@ -3176,22 +3616,40 @@ class AnyPkgApp(Gtk.Application):
 
 
 def main():
-    if len(sys.argv) >= 2 and (
-        sys.argv[1] == "--askpass"
-        or "password" in sys.argv[1].lower()
-        or "[sudo]" in sys.argv[1].lower()
+    argv = sys.argv[1:]
+
+    # Built-in graphical SUDO_ASKPASS mode (only available in GUI builds)
+    if argv and (
+        argv[0] == "--askpass"
+        or "password" in argv[0].lower()
+        or "[sudo]" in argv[0].lower()
     ):
-        prompt = (
-            sys.argv[2]
-            if (sys.argv[1] == "--askpass" and len(sys.argv) > 2)
-            else sys.argv[1]
-        )
+        if not HAS_GUI:
+            sys.exit(1)
+        prompt = argv[1] if (argv[0] == "--askpass" and len(argv) > 1) else argv[0]
         sys.exit(run_askpass_dialog(prompt))
+
+    # CLI entry points: subcommands plus top-level -h/--help/--version
+    parser = build_cli_parser()
+    if not argv or argv[0] in ("convert", "-h", "--help", "--version"):
+        args = parser.parse_args(argv)
+        if getattr(args, "command", None) == "convert":
+            sys.exit(run_convert_cli(args))
+        # -h / --help / --version exit inside parse_args; no subcommand -> GUI below
+
+    # Legacy GUI launch: anypkg [--auto] [package-file]
+    if not HAS_GUI:
+        print(
+            "AnyPkg GUI needs PyGObject + GTK4 (install via ./install.sh: python3-gi, gir1.2-gtk-4.0). "
+            "On a headless machine use the CLI instead: anypkg convert --help",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     auto_run = False
     pkg_arg: Path | None = None
 
-    for arg in sys.argv[1:]:
+    for arg in argv:
         if arg in ("-a", "--auto"):
             auto_run = True
         elif not arg.startswith("-"):
