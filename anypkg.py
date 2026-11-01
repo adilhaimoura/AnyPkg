@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-AnyPkg v1.1.0 — Universal Native Linux Package Installer & Cross-Format Exporter
+AnyPkg v1.1.1 — Universal Native Linux Package Installer & Cross-Format Exporter
 Features a dual Paper-Folder Tab Widescreen Dashboard (1310x710 for 1360x766 laptops):
   • Tab 1: [📥 Native System Installer] — One-click native install into your host distro
            (Debian/Ubuntu/Mint .deb, Fedora/openSUSE .rpm, or Arch/Manjaro .pkg.tar.zst)
   • Tab 2: [📤 Package Converter / Exporter] — Convert & export between Linux package formats
            (.deb ⇄ .rpm ⇄ .AppImage ⇄ .pkg.tar.zst ⇄ .apk ⇄ .xbps ⇄ .txz ⇄ .tar.zst)
            with BULK export: multi-select files, multi-file drag & drop, or open a folder
-  • Headless CLI (new in v1.1.0): `anypkg convert SOURCE... --to FORMAT [-o DIR] [--pattern GLOB]`
+  • Headless CLI: `anypkg convert SOURCE... [--to FORMAT | DEST-FILE] [-o DIR] [--pattern GLOB] [--gui]`
            bulk inputs: files, folders (top level only, one source type per run) or globs;
+           without --to, the LAST argument's extension picks the target (app.deb -> app.rpm);
            `--to native` = this machine's distro format (auto-detected)
+  • `anypkg install SOURCE... [--pattern GLOB] [--keep]` — convert to native + install via pkexec
 
 Credits: the original `convert` CLI subcommand idea came from the fork by
-         @Coding-01 (https://github.com/Coding-01) — v1.1.0 keeps it and extends it
+         @Coding-01 (https://github.com/Coding-01) — kept and extended in v1.1.x
          with proper --help/--version, bulk inputs and dependency mapping. Thank you!
 """
 
@@ -65,7 +67,7 @@ except Exception:
 
 
 APP_ID = "org.anypkg.installer"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 APP_TITLE = f"AnyPkg v{APP_VERSION} — Universal Linux Package Installer & Exporter"
 CONFIG_DIR = Path.home() / ".config" / "anypkg"
 CONFIG_FILE = CONFIG_DIR / "settings.json"
@@ -1698,7 +1700,7 @@ def is_debtap_initialized() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Main Widescreen Window with Paper-Folder Tabs (v1.1.0)
+# Main Widescreen Window with Paper-Folder Tabs (v1.1.1)
 # ---------------------------------------------------------------------------
 class AnyPkgWindow(_WINDOW_BASE):
     def __init__(
@@ -3463,38 +3465,76 @@ def expand_cli_sources(sources: list[str], pattern: str | None) -> list[Path]:
     return ordered
 
 
+def format_legend() -> str:
+    """Human-readable legend of the export target formats (used in --help and error messages)."""
+    lines = ["target formats (--to KEY, or inferred from a destination filename):"]
+    for key, label, ext in EXPORT_FORMATS:
+        lines.append(f"  {key:<10} {ext:<15} {label}")
+    lines.append("  native     (auto)       this machine's distro package format (auto-detected)")
+    return "\n".join(lines)
+
+
+def split_dest_source(sources: list[str], to: str | None):
+    """
+    Destination-filename inference: when --to is not given and there are 2+
+    positional args, the LAST one is treated as the destination package filename
+    if its extension maps to a known export format, e.g.:
+
+        anypkg convert telegram.deb telegram.pkg.tar.zst
+
+    Returns (dest_path | None, remaining_sources).
+    """
+    if to or len(sources) < 2:
+        return None, list(sources)
+    last = sources[-1]
+    if os.path.isdir(last):
+        return None, list(sources)
+    fmt = detect_package_format(Path(last))
+    export_keys = {k for k, _label, _ext in EXPORT_FORMATS}
+    if fmt in export_keys:
+        return Path(last), list(sources[:-1])
+    return None, list(sources)
+
+
 def build_cli_parser() -> argparse.ArgumentParser:
+    legend = format_legend()
     parser = argparse.ArgumentParser(
         prog="anypkg",
         description=(
             f"AnyPkg v{APP_VERSION} — Universal Native Linux Package Installer & Cross-Format Exporter.\n"
-            "Run without arguments to open the graphical dashboard; use a subcommand for headless CLI use."
+            "Run without arguments to open the graphical dashboard; use a subcommand for CLI use."
         ),
         epilog=(
             "examples:\n"
             "  anypkg convert ./app.deb --to rpm -o ./out\n"
+            "  anypkg convert telegram.deb telegram.pkg.tar.zst   # target inferred from destination name\n"
             "  anypkg convert ./downloads --to native --pattern '*.deb'\n"
-            "  anypkg convert a.deb b.rpm c.AppImage --to appimage\n"
-            "  anypkg convert '*.pkg.tar.zst' --to deb -o ./converted\n"
-            "\n"
-            "Run 'anypkg convert --help' for all convert options."
+            "  anypkg convert app.deb --to native --gui          # convert, then review in the GUI\n"
+            "  anypkg install ./app.rpm --keep                    # convert to native + install (root)\n"
+            "\n" + legend
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"AnyPkg v{APP_VERSION}")
     sub = parser.add_subparsers(dest="command", metavar="command")
+
     conv = sub.add_parser(
         "convert",
         help="convert one or more packages to a target format (bulk supported)",
         description=(
-            "Convert package file(s), folder(s) or glob(s) into one target format. "
-            "Folders are scanned top level only; use --pattern to pick one source type."
+            "Convert package file(s), folder(s) or glob(s) into one target format.\n"
+            "Folders are scanned top level only; use --pattern to pick one source type.\n"
+            "If --to is omitted, the LAST argument is read as the destination filename and\n"
+            "its extension picks the target format (e.g. telegram.pkg.tar.zst -> arch)."
         ),
         epilog=(
             "examples:\n"
             "  anypkg convert ./app.deb --to rpm\n"
+            "  anypkg convert telegram.deb telegram.pkg.tar.zst\n"
+            "  anypkg convert a.deb b.deb out.rpm -o ./converted\n"
             "  anypkg convert ./downloads --to native --pattern '*.deb' -o ./out\n"
-            "  anypkg convert a.deb b.rpm --to appimage --no-map-deps"
+            "  anypkg convert app.deb --to native --gui\n"
+            "\n" + legend
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -3502,49 +3542,107 @@ def build_cli_parser() -> argparse.ArgumentParser:
         "sources",
         nargs="+",
         metavar="SOURCE",
-        help="package file(s), folder(s) (top level only), or glob pattern(s)",
+        help="package file(s), folder(s) (top level only), glob(s); without --to, "
+             "the last SOURCE is the destination filename",
     )
     conv.add_argument(
         "--to",
-        required=True,
+        default=None,
         dest="to",
         choices=[k for k, _label, _ext in EXPORT_FORMATS] + ["native"],
-        help="target format; 'native' = this machine's distro format (auto-detected)",
+        help="target format (optional if a destination filename is given); "
+             "'native' = this machine's distro format (auto-detected)",
     )
     conv.add_argument(
-        "-o", "--output", default=".", help="output directory (default: current directory)"
+        "-o", "--output", default=None,
+        help="output directory (default: the destination file's folder, or the current directory)",
     )
     conv.add_argument(
-        "--pattern",
-        default=None,
-        metavar="GLOB",
+        "--pattern", default=None, metavar="GLOB",
         help="only include files whose name matches GLOB, e.g. '*.deb'",
     )
     conv.add_argument(
-        "--no-map-deps",
-        action="store_true",
+        "--no-map-deps", action="store_true",
         help="skip the ELF scan / dependency mapping written into the exported package",
+    )
+    conv.add_argument(
+        "--gui", action="store_true",
+        help="after converting, open the GUI with the converted package loaded in the "
+             "Installer tab so you can review it and install manually",
+    )
+
+    inst = sub.add_parser(
+        "install",
+        help="convert package(s) to the native host format and install them (root via pkexec)",
+        description=(
+            "Convert package file(s), folder(s) or glob(s) to your distro's NATIVE format and "
+            "install each one with the system package manager (pkexec pacman/apt/dnf/zypper). "
+            "Unresolvable foreign dependencies are stripped automatically (same rules as the GUI)."
+        ),
+        epilog=(
+            "examples:\n"
+            "  anypkg install ./app.deb\n"
+            "  anypkg install a.rpm b.pkg.tar.zst\n"
+            "  anypkg install ./downloads --pattern '*.deb' --keep\n"
+            "\n" + legend
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    inst.add_argument(
+        "sources", nargs="+", metavar="SOURCE",
+        help="package file(s), folder(s) (top level only), or glob pattern(s)",
+    )
+    inst.add_argument(
+        "--pattern", default=None, metavar="GLOB",
+        help="only include files whose name matches GLOB, e.g. '*.deb'",
+    )
+    inst.add_argument(
+        "--keep", action="store_true",
+        help="keep the converted native package next to each source file "
+             "(default: convert in a temp dir and remove it afterwards)",
     )
     return parser
 
 
-def run_convert_cli(args: argparse.Namespace) -> int:
+def run_convert_cli(args: argparse.Namespace) -> tuple[int, list[Path]]:
+    """`anypkg convert ...` — returns (exit_code, list of successfully converted files)."""
+    dest, raw_sources = split_dest_source(args.sources, args.to)
     target_fmt = args.to
+    if target_fmt is None:
+        if dest is None:
+            print(
+                "error: no target format given — use --to FORMAT or end with a destination "
+                "filename (e.g. anypkg convert app.deb app.rpm)\n\n" + format_legend(),
+                file=sys.stderr,
+            )
+            return 2, []
+        target_fmt = detect_package_format(dest)
+        print(f"==> Destination '{dest.name}' -> target format: {target_fmt}")
     if target_fmt == "native":
         target_fmt = detect_host_distro()["base"]
         print(f"==> Host distro detected — native target format: {target_fmt}")
-    output_dir = Path(args.output).resolve()
+
+    if args.output:
+        output_dir = Path(args.output).resolve()
+    elif dest is not None:
+        output_dir = (dest.parent if str(dest.parent) not in ("", ".") else Path(".")).resolve()
+    else:
+        output_dir = Path.cwd()
+
     try:
-        sources = expand_cli_sources(args.sources, args.pattern)
+        sources = expand_cli_sources(raw_sources, args.pattern)
     except CliError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return 2, []
     if not sources:
         print("error: no supported package files found in the given source(s).", file=sys.stderr)
-        return 2
+        return 2, []
+    if dest is not None and dest.resolve() in {s.resolve() for s in sources}:
+        dest = None  # never treat a source file as the destination
 
     total = len(sources)
-    print(f"==> AnyPkg v{APP_VERSION} bulk convert: {total} file(s) -> .{target_fmt} -> {output_dir}")
+    target_ext = next((e for k, _l, e in EXPORT_FORMATS if k == target_fmt), f".{target_fmt}")
+    print(f"==> AnyPkg v{APP_VERSION} bulk convert: {total} file(s) -> {target_ext} -> {output_dir}")
     succeeded: list[Path] = []
     failed: list[tuple[Path, str]] = []
     for idx, src in enumerate(sources, 1):
@@ -3552,8 +3650,20 @@ def run_convert_cli(args: argparse.Namespace) -> int:
         try:
             result = convert_one_package(src, target_fmt, output_dir, print, map_deps=not args.no_map_deps)
             if result:
-                succeeded.append(result["out"])
-                print(f"==> ✓ [{idx}/{total}] {result['out']}")
+                out = result["out"]
+                # single source + destination filename given -> rename the output to that exact name
+                if dest is not None and total == 1 and dest.resolve() != out.resolve():
+                    ext = next((e for k, _l, e in EXPORT_FORMATS if k == target_fmt), "")
+                    base = dest.name[: -len(ext)] if ext and dest.name.endswith(ext) else dest.stem
+                    final = output_dir / dest.name
+                    counter = 2
+                    while final.exists():
+                        final = output_dir / f"{base}-{counter}{ext}"
+                        counter += 1
+                    shutil.move(str(out), str(final))
+                    out = final
+                succeeded.append(out)
+                print(f"==> ✓ [{idx}/{total}] {out}")
             else:
                 failed.append((src, "builder produced no output file"))
                 print(f"==> ✗ [{idx}/{total}] {src.name}: build failed (see messages above)")
@@ -3564,6 +3674,121 @@ def run_convert_cli(args: argparse.Namespace) -> int:
     print(f"\n==> Summary: {len(succeeded)}/{total} converted -> {output_dir}")
     for p in succeeded:
         print(f"    ✓ {p.name}")
+    for p, reason in failed:
+        print(f"    ✗ {p.name} — {reason}")
+    return (0 if not failed else 1), succeeded
+
+
+def run_cmd_streaming(cmd: list[str], log_fn, cwd: Path | None = None, env: dict | None = None) -> int:
+    """Run a command, streaming merged stdout/stderr into log_fn. Returns the exit code."""
+    log_fn("$ " + " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        log_fn(re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", line).rstrip("\n"))
+    proc.wait()
+    return proc.returncode
+
+
+def cli_root_install(pkg: Path, host: dict, log_fn) -> int:
+    """Install a native package as root via pkexec (uses the polkit root helper if installed)."""
+    if Path(ROOT_HELPER).exists():
+        return run_cmd_streaming(["pkexec", ROOT_HELPER, "install-pkg", str(pkg)], log_fn)
+    base = host["base"]
+    if base == "arch":
+        cmd = ["pkexec", "pacman", "-U", "--noconfirm", "--needed", str(pkg)]
+    elif base == "deb":
+        cmd = ["pkexec", "apt-get", "install", "-y", "--allow-downgrades", str(pkg)]
+    elif host["pkg_mgr"] == "zypper":
+        cmd = ["pkexec", "zypper", "--non-interactive", "install", "--allow-unsigned-rpm", str(pkg)]
+    else:
+        cmd = ["pkexec", "dnf", "install", "-y", str(pkg)]
+    return run_cmd_streaming(cmd, log_fn)
+
+
+def run_install_cli(args: argparse.Namespace) -> int:
+    """`anypkg install SOURCE...` — convert each package to the native host format, then install as root."""
+    host = detect_host_distro()
+    target_fmt = host["base"]
+    settings = load_settings()
+    aur_helper = settings.get("aur_helper", "yay")
+    try:
+        sources = expand_cli_sources(args.sources, args.pattern)
+    except CliError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not sources:
+        print("error: no supported package files found in the given source(s).", file=sys.stderr)
+        return 2
+
+    total = len(sources)
+    print(
+        f"==> AnyPkg v{APP_VERSION} install: {total} file(s) -> native .{target_fmt} "
+        f"-> {host['pkg_mgr']} (root via pkexec)"
+    )
+    succeeded = 0
+    failed: list[tuple[Path, str]] = []
+    tmp_dirs: list[Path] = []
+    for idx, src in enumerate(sources, 1):
+        print(f"\n===== [{idx}/{total}] {src.name} ({detect_package_format(src)}) -> install native {target_fmt} =====")
+        try:
+            if args.keep:
+                out_dir = src.parent
+            else:
+                out_dir = Path(tempfile.mkdtemp(prefix="anypkg-install-"))
+                tmp_dirs.append(out_dir)
+            result = convert_one_package(src, target_fmt, out_dir, print, map_deps=True)
+            if not result:
+                failed.append((src, "conversion to native failed"))
+                print(f"==> ✗ [{idx}/{total}] {src.name}: conversion failed (see messages above)")
+                continue
+            pkg = result["out"]
+            print(f"==> Converted native package: {pkg}")
+
+            # Same dependency rules as the GUI installer: strip unresolvable, auto-install AUR deps
+            raw_deps = read_package_deps(pkg)
+            classified = classify_dependencies(raw_deps, target_fmt, aur_helper)
+            missing = {d["raw"] for d in classified if d["status"] == "missing"}
+            aur_deps = [d["name"] for d in classified if d["status"] == "aur"]
+            if missing and settings.get("auto_fix_missing_deps", True):
+                repack_package_without_deps(pkg, missing, print)
+            if (
+                target_fmt == "arch"
+                and aur_deps
+                and settings.get("install_aur_deps", True)
+                and aur_helper in ("yay", "paru")
+                and shutil.which(aur_helper)
+            ):
+                env = os.environ.copy()
+                env["SUDO_ASKPASS"] = str(Path(__file__).resolve())
+                run_cmd_streaming(
+                    [aur_helper, "-S", "--needed", "--noconfirm", "--sudoflags", "-A", *aur_deps],
+                    print,
+                    env=env,
+                )
+
+            rc = cli_root_install(pkg, host, print)
+            if rc == 0:
+                succeeded += 1
+                print(f"==> ✓ [{idx}/{total}] installed {pkg.name} natively")
+            else:
+                failed.append((src, f"package manager exited with code {rc}"))
+                print(f"==> ✗ [{idx}/{total}] {src.name}: install failed (exit {rc})")
+        except Exception as exc:
+            failed.append((src, str(exc)))
+            print(f"==> ✗ [{idx}/{total}] {src.name}: {exc}")
+
+    for d in tmp_dirs:
+        shutil.rmtree(d, ignore_errors=True)
+    print(f"\n==> Summary: {succeeded}/{total} installed natively ({target_fmt})")
     for p, reason in failed:
         print(f"    ✗ {p.name} — {reason}")
     return 0 if not failed else 1
@@ -3631,10 +3856,24 @@ def main():
 
     # CLI entry points: subcommands plus top-level -h/--help/--version
     parser = build_cli_parser()
-    if not argv or argv[0] in ("convert", "-h", "--help", "--version"):
+    if not argv or argv[0] in ("convert", "install", "-h", "--help", "--version"):
         args = parser.parse_args(argv)
-        if getattr(args, "command", None) == "convert":
-            sys.exit(run_convert_cli(args))
+        command = getattr(args, "command", None)
+        if command == "convert":
+            code, succeeded = run_convert_cli(args)
+            if getattr(args, "gui", False):
+                if succeeded and HAS_GUI:
+                    print(f"==> Opening the GUI with the converted package: {succeeded[0]}")
+                    app = AnyPkgApp(initial_pkg=succeeded[0], auto_run=False)
+                    sys.exit(app.run([]))
+                if not HAS_GUI:
+                    print(
+                        "warning: --gui needs PyGObject + GTK4 on this machine; staying in CLI mode.",
+                        file=sys.stderr,
+                    )
+            sys.exit(code)
+        if command == "install":
+            sys.exit(run_install_cli(args))
         # -h / --help / --version exit inside parse_args; no subcommand -> GUI below
 
     # Legacy GUI launch: anypkg [--auto] [package-file]

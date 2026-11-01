@@ -1,4 +1,4 @@
-# AnyPkg v1.1.0 — Universal Native Linux Package Installer & Cross-Format Exporter
+# AnyPkg v1.1.1 — Universal Native Linux Package Installer & Cross-Format Exporter
 
 > **Install any Linux package format natively onto your distro (`apt`, `dnf`/`zypper`, or `pacman`), OR convert & export between formats (`.deb` ⇄ `.rpm` ⇄ `.AppImage` ⇄ `.pkg.tar.zst` ⇄ `.apk` ⇄ `.xbps` ⇄ `.txz` ⇄ `.tar.zst`).**  
 > *Zero `snapd` daemon. Zero `flatpak` runtime bloat. 100% Native packages.*
@@ -39,31 +39,44 @@ Designed for **`1360x766` laptop screens** (and scaling cleanly to larger deskto
 
 ---
 
-## Headless CLI (`v1.1.0`)
+## Headless CLI (`v1.1.1`)
 
 After `./install.sh`, AnyPkg is on your `PATH` as `anypkg`. Run it **without arguments** to open the GUI, or use the CLI on servers, scripts and CI (works **without GTK** — no display needed):
 
 ```bash
 anypkg --version                        # print version
-anypkg --help                           # top-level help with examples
+anypkg --help                           # top-level help (includes the format legend)
 anypkg convert --help                   # convert subcommand help
+anypkg install --help                   # install subcommand help
 
-# single file
+# single file, explicit target
 anypkg convert ./app.deb --to rpm -o ./out
+
+# target taken from the destination filename (no --to needed!)
+anypkg convert telegram.deb telegram.pkg.tar.zst
+anypkg convert a.deb b.deb out.rpm -o ./converted     # bulk: target = .rpm
 
 # bulk: a whole folder, one source type at a time (top level only, no subfolders)
 anypkg convert ./downloads --to native --pattern '*.deb' -o ./out
 
-# bulk: several explicit files, or a glob (quote it so anypkg expands it)
-anypkg convert a.deb b.rpm c.AppImage --to appimage
+# bulk: a glob (quote it so anypkg expands it)
 anypkg convert '*.pkg.tar.zst' --to deb -o ./converted
+
+# convert, then review the result in the GUI and decide whether to install
+anypkg convert app.deb --to native --gui
+
+# convert to native + install as root (pkexec), keeping the converted file
+anypkg install ./app.rpm --keep
+anypkg install ./downloads --pattern '*.deb'
 ```
 
 - Each `SOURCE` may be a package **file**, a **folder** (scanned top level only), or a **glob pattern**.
-- `--to` accepts `deb`, `rpm`, `arch`, `appimage`, `apk`, `xbps`, `slackware`, `tarball`, or **`native`** (= your host distro's package format, auto-detected).
+- `--to` accepts `deb`, `rpm`, `arch`, `appimage`, `apk`, `xbps`, `slackware`, `tarball`, or **`native`** (= your host distro's package format, auto-detected). It is **optional**: if omitted, the **last** argument is read as the destination filename and its extension picks the format (`telegram.pkg.tar.zst` → `arch`, `out.rpm` → `rpm`, …). The full legend is printed by `--help`.
 - `--pattern '*.deb'` restricts folder/glob inputs to one source type; a folder with **mixed** formats is rejected with a hint unless you pass `--pattern` — one source type per run, one target format per run.
-- By default the ELF shared-library scan maps dependencies into the exported package (same shared engine as the GUI Exporter tab); pass `--no-map-deps` to skip it.
-- Exit codes: `0` = everything converted, `1` = some files failed (a per-file summary is printed), `2` = bad input/usage. Output filename collisions get a `-2`, `-3`, … suffix instead of overwriting.
+- `--gui` (convert only): after converting, opens the GUI with the converted package loaded in the Installer tab so you can review dependencies and install manually. Needs GTK on the machine.
+- `anypkg install` converts each source to the **native** format and installs it with your package manager via `pkexec` (`pacman -U` / `apt-get install` / `dnf` / `zypper`), stripping unresolvable foreign dependencies automatically — the same rules as the GUI installer. `--keep` leaves the converted native file next to each source.
+- By default the ELF shared-library scan maps dependencies into the exported package (same shared engine as the GUI Exporter tab); pass `--no-map-deps` to skip it (convert only).
+- Exit codes: `0` = everything done, `1` = some files failed (a per-file summary is printed), `2` = bad input/usage. Output filename collisions get a `-2`, `-3`, … suffix instead of overwriting.
 
 ## Installation (Arch, Ubuntu/Mint/Debian, Fedora, openSUSE)
 
