@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# scratch area for manual testing (downloaded packages, shims, fixtures) — never committed
+tests/trial/*
+!tests/trial/README.md
