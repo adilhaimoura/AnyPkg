@@ -31,6 +31,10 @@ out=$($PY anypkg.py install -h 2>&1); rc=$?
 check_eq "install -h exit" "0" "$rc"
 check_contains "install -h documents --keep" "$out" "--keep"
 
+out=$($PY anypkg.py inspect -h 2>&1); rc=$?
+check_eq "inspect -h exit" "0" "$rc"
+check_contains "inspect -h mentions Electron" "$out" "Electron"
+
 # error paths
 $PY anypkg.py convert /nonexistent.deb --to rpm >/dev/null 2>&1; check_eq "missing source exit" "2" "$?"
 $PY anypkg.py convert /nonexistent.deb >/dev/null 2>&1; check_eq "single arg without --to/dest exit" "2" "$?"
@@ -50,6 +54,8 @@ check_contains "destination filename inference" "$out" "Destination 'telegram.pk
 out=$($PY anypkg.py convert "$FX/a-1.0_amd64.deb" "$FX/c-1.0.x86_64.rpm" --to rpm -o "$FX/out" 2>&1)
 check_contains "explicit multi-file bulk header" "$out" "bulk convert: 2 file(s) -> .rpm"
 rm -rf "$FX"
+
+if $PY tests/test_detect_electron.py >/dev/null 2>&1; then ok "electron detection unit tests (tests/test_detect_electron.py)"; else bad "electron detection unit tests (run: python3 tests/test_detect_electron.py)"; fi
 
 echo
 if [[ $fail -eq 0 ]]; then echo "ALL SMOKE TESTS PASSED"; else echo "SOME TESTS FAILED"; exit 1; fi

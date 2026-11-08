@@ -68,12 +68,16 @@ anypkg convert app.deb --to native --gui
 # convert to native + install as root (pkexec), keeping the converted file
 anypkg install ./app.rpm --keep
 anypkg install ./downloads --pattern '*.deb'
+
+# inspect only: metadata + bundled-Electron detection (version, size, sha256, stock/modified)
+anypkg inspect ./app.deb
 ```
 
 - Each `SOURCE` may be a package **file**, a **folder** (scanned top level only), or a **glob pattern**.
 - `--to` accepts `deb`, `rpm`, `arch`, `appimage`, `apk`, `xbps`, `slackware`, `tarball`, or **`native`** (= your host distro's package format, auto-detected). It is **optional**: if omitted, the **last** argument is read as the destination filename and its extension picks the format (`telegram.pkg.tar.zst` → `arch`, `out.rpm` → `rpm`, …). The full legend is printed by `--help`.
 - `--pattern '*.deb'` restricts folder/glob inputs to one source type; a folder with **mixed** formats is rejected with a hint unless you pass `--pattern` — one source type per run, one target format per run.
 - `--gui` (convert only): after converting, opens the GUI with the converted package loaded in the Installer tab so you can review dependencies and install manually. Needs GTK on the machine.
+- `anypkg inspect SOURCE...` shows metadata and detects a **bundled Electron** runtime — version, runtime size, binary sha256, and a stock-vs-modified verdict against the installed system `electronXX` package — without converting anything.
 - `anypkg install` converts each source to the **native** format and installs it with your package manager via `pkexec` (`pacman -U` / `apt-get install` / `dnf` / `zypper`), stripping unresolvable foreign dependencies automatically — the same rules as the GUI installer. `--keep` leaves the converted native file next to each source.
 - By default the ELF shared-library scan maps dependencies into the exported package (same shared engine as the GUI Exporter tab); pass `--no-map-deps` to skip it (convert only).
 - Exit codes: `0` = everything done, `1` = some files failed (a per-file summary is printed), `2` = bad input/usage. Output filename collisions get a `-2`, `-3`, … suffix instead of overwriting.

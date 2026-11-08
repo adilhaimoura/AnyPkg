@@ -12,6 +12,7 @@ Features a dual Paper-Folder Tab Widescreen Dashboard (1310x710 for 1360x766 lap
            without --to, the LAST argument's extension picks the target (app.deb -> app.rpm);
            `--to native` = this machine's distro format (auto-detected)
   • `anypkg install SOURCE... [--pattern GLOB] [--keep]` — convert to native + install via pkexec
+  • `anypkg inspect SOURCE...` — metadata + bundled-Electron detection (version, size, sha256, stock/modified)
 
 Credits: the original `convert` CLI subcommand idea came from the fork by
          @Coding-01 (https://github.com/Coding-01) — kept and extended in v1.1.x
@@ -23,6 +24,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import glob
+import hashlib
 import json
 import os
 import plistlib
@@ -3345,6 +3347,7 @@ def convert_one_package(
         stage_dir.mkdir(parents=True, exist_ok=True)
 
         meta, extra_deps = extract_any_to_stage(src_path, stage_dir, work_dir, log_fn)
+        log_electron_detection(stage_dir, log_fn)
 
         resolved_deps: list[str] = []
         if map_deps and target_fmt not in ("appimage", "tarball", "slackware"):
@@ -3496,6 +3499,199 @@ def split_dest_source(sources: list[str], to: str | None):
     return None, list(sources)
 
 
+# ---------------------------------------------------------------------------
+# Bundled-Electron detection (read-only). Used by `anypkg inspect` and logged
+# during convert/install so users can SEE which runtime a package ships with
+# before deciding anything about debundling.
+# ---------------------------------------------------------------------------
+ELECTRON_VERSION_RE = re.compile(rb"Electron/(\d+\.\d+\.\d+)")
+CHROME_VERSION_RE = re.compile(rb"Chrome/(\d+\.\d+\.\d+\.\d+)")
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _is_elf(path: Path) -> bool:
+    try:
+        with path.open("rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except Exception:
+        return False
+
+
+def _read_version_strings(path: Path) -> tuple[str | None, str | None]:
+    """Scan a binary in chunks for its embedded Electron/ and Chrome/ version strings."""
+    elec = chrome = None
+    with path.open("rb") as f:
+        overlap = b""
+        while elec is None or chrome is None:
+            chunk = f.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            data = overlap + chunk
+            if elec is None:
+                m = ELECTRON_VERSION_RE.search(data)
+                if m:
+                    elec = m.group(1).decode()
+            if chrome is None:
+                m = CHROME_VERSION_RE.search(data)
+                if m:
+                    chrome = m.group(1).decode()
+            overlap = data[-64:]
+    return elec, chrome
+
+
+def find_electron_bundle(stage_dir: Path) -> dict | None:
+    """
+    Detect a bundled Electron runtime inside an extracted package stage.
+    Looks for resources/app.asar (or resources/app/) plus a large ELF binary
+    next to it (the Electron runtime itself, normally ~100 MB+).
+    Returns None when no Electron bundle is found.
+    """
+    asar_hits = list(stage_dir.rglob("resources/app.asar"))
+    asar_hits += [p for p in stage_dir.rglob("resources/app") if p.is_dir()]
+    for asar in asar_hits:
+        root = asar.parent.parent  # bundle root containing resources/
+        candidates = [p for p in root.iterdir() if p.is_file() and _is_elf(p)]
+        if not candidates:
+            continue
+        binary = max(candidates, key=lambda p: p.stat().st_size)
+        if binary.stat().st_size < 20 * 1024 * 1024:
+            continue  # too small to be the Electron runtime
+        elec_ver, chrome_ver = _read_version_strings(binary)
+        if not elec_ver:
+            continue
+        total = 0
+        for p in root.rglob("*"):
+            if p.is_file() and not p.is_symlink():
+                total += p.stat().st_size
+        return {
+            "bundle_root": root,
+            "asar": asar,
+            "binary": binary,
+            "version": elec_ver,
+            "chrome": chrome_ver or "?",
+            "major": int(elec_ver.split(".")[0]),
+            "runtime_mb": total / (1024 * 1024),
+            "sha256": sha256_file(binary),
+        }
+    return None
+
+
+def system_electron_info(major: int) -> dict:
+    """
+    Best-effort lookup of an installed system electron<major> package and the
+    sha256 of its runtime binary, so a bundled copy can be classified as
+    stock (hash matches) or modified (hash differs).
+    """
+    name = f"electron{major}"
+    info = {"package": None, "binary": None, "sha256": None}
+    if shutil.which("pacman"):
+        q = subprocess.run(["pacman", "-Q", name], capture_output=True, text=True, check=False)
+        if q.returncode == 0:
+            info["package"] = name
+    if info["package"] is None and shutil.which("dpkg-query"):
+        q = subprocess.run(
+            ["dpkg-query", "-W", "-f=${Status}", name], capture_output=True, text=True, check=False
+        )
+        if q.returncode == 0 and "install ok installed" in q.stdout:
+            info["package"] = name
+    if info["package"] is None and shutil.which("rpm"):
+        q = subprocess.run(["rpm", "-q", name], capture_output=True, text=True, check=False)
+        if q.returncode == 0:
+            info["package"] = name
+    if info["package"]:
+        for cand in (
+            Path(f"/usr/lib/{name}/electron"),
+            Path(f"/usr/lib64/{name}/electron"),
+            Path("/usr/bin/electron"),
+            Path("/usr/lib/electron/electron"),
+            Path("/usr/share/electron/electron"),
+        ):
+            if cand.exists():
+                info["binary"] = str(cand)
+                info["sha256"] = sha256_file(cand)
+                break
+    return info
+
+
+def electron_verdict(elec: dict) -> str:
+    """Human-readable stock/modified verdict for a detected bundle."""
+    si = system_electron_info(elec["major"])
+    if si.get("package") and si.get("sha256"):
+        if si["sha256"] == elec["sha256"]:
+            return f"MATCHES system {si['package']} binary (stock Electron — safe to debundle)"
+        return f"DIFFERS from system {si['package']} binary (modified/patched build — keep bundled)"
+    if si.get("package"):
+        return f"system {si['package']} installed (runtime binary not found to hash)"
+    return f"no electron{elec['major']} installed on this host"
+
+
+def log_electron_detection(stage_dir: Path, log_fn) -> None:
+    """Log a one-liner about any bundled Electron found in the stage (if any)."""
+    try:
+        elec = find_electron_bundle(stage_dir)
+    except Exception:
+        return
+    if elec:
+        log_fn(
+            f"==> Bundled Electron {elec['version']} detected ({elec['binary'].name}, "
+            f"runtime ≈ {elec['runtime_mb']:.0f} MB, sha256 {elec['sha256'][:12]}…)"
+        )
+        log_fn(f"==> Electron check: {electron_verdict(elec)}")
+
+
+def run_inspect_cli(args: argparse.Namespace) -> int:
+    """`anypkg inspect SOURCE...` — metadata + bundled-Electron detection, no conversion."""
+    try:
+        sources = expand_cli_sources(args.sources, args.pattern)
+    except CliError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not sources:
+        print("error: no supported package files found in the given source(s).", file=sys.stderr)
+        return 2
+    failed = 0
+    total = len(sources)
+    for idx, src in enumerate(sources, 1):
+        print(f"\n===== [{idx}/{total}] {src} =====")
+        meta = parse_package_metadata(src)
+        print(f"  format       : {meta.get('Format')}")
+        print(f"  package      : {meta.get('Package')}")
+        print(f"  version/arch : {meta.get('Version')} / {meta.get('Architecture')}")
+        print(f"  archive size : {meta.get('Installed-Size')}")
+        print(f"  declared deps: {meta.get('Depends')}")
+        try:
+            with tempfile.TemporaryDirectory(prefix="anypkg-inspect-") as td:
+                work = Path(td)
+                stage = work / "stage"
+                stage.mkdir(parents=True, exist_ok=True)
+                extract_any_to_stage(src, stage, work, lambda m: None)
+                elec = find_electron_bundle(stage)
+                if elec:
+                    print(f"  BUNDLED ELECTRON v{elec['version']} (major {elec['major']}, chrome {elec['chrome']})")
+                    print(f"    bundle root : {elec['bundle_root'].relative_to(stage)}")
+                    print(f"    binary      : {elec['binary'].name}  sha256 {elec['sha256'][:16]}…")
+                    print(f"    runtime size: ≈ {elec['runtime_mb']:.1f} MB")
+                    print(f"    app.asar    : {elec['asar'].relative_to(stage)}")
+                    print(f"    verdict     : {electron_verdict(elec)}")
+                else:
+                    print("  bundled electron: none detected")
+                sonames = scan_elf_needed_sonames(stage, lambda m: None)
+                if sonames:
+                    shown = ", ".join(sonames[:15]) + (" …" if len(sonames) > 15 else "")
+                    print(f"  ELF NEEDED (not bundled): {shown}")
+        except Exception as exc:
+            print(f"  extraction failed: {exc}")
+            failed += 1
+    return 1 if failed else 0
+
+
 def build_cli_parser() -> argparse.ArgumentParser:
     legend = format_legend()
     parser = argparse.ArgumentParser(
@@ -3511,6 +3707,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  anypkg convert ./downloads --to native --pattern '*.deb'\n"
             "  anypkg convert app.deb --to native --gui          # convert, then review in the GUI\n"
             "  anypkg install ./app.rpm --keep                    # convert to native + install (root)\n"
+            "  anypkg inspect ./app.deb                           # metadata + bundled-Electron detection\n"
             "\n" + legend
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3600,6 +3797,29 @@ def build_cli_parser() -> argparse.ArgumentParser:
         "--keep", action="store_true",
         help="keep the converted native package next to each source file "
              "(default: convert in a temp dir and remove it afterwards)",
+    )
+    insp = sub.add_parser(
+        "inspect",
+        help="inspect package(s): metadata + bundled Electron detection (no conversion)",
+        description=(
+            "Show package metadata and whether a bundled Electron runtime is present "
+            "(version, runtime size, sha256, and a stock-vs-modified verdict against the "
+            "installed system electronXX package)."
+        ),
+        epilog=(
+            "examples:\n"
+            "  anypkg inspect ./app.deb\n"
+            "  anypkg inspect ./downloads --pattern '*.deb'"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    insp.add_argument(
+        "sources", nargs="+", metavar="SOURCE",
+        help="package file(s), folder(s) (top level only), or glob pattern(s)",
+    )
+    insp.add_argument(
+        "--pattern", default=None, metavar="GLOB",
+        help="only include files whose name matches GLOB, e.g. '*.deb'",
     )
     return parser
 
@@ -3856,7 +4076,7 @@ def main():
 
     # CLI entry points: subcommands plus top-level -h/--help/--version
     parser = build_cli_parser()
-    if not argv or argv[0] in ("convert", "install", "-h", "--help", "--version"):
+    if not argv or argv[0] in ("convert", "install", "inspect", "-h", "--help", "--version"):
         args = parser.parse_args(argv)
         command = getattr(args, "command", None)
         if command == "convert":
@@ -3874,6 +4094,8 @@ def main():
             sys.exit(code)
         if command == "install":
             sys.exit(run_install_cli(args))
+        if command == "inspect":
+            sys.exit(run_inspect_cli(args))
         # -h / --help / --version exit inside parse_args; no subcommand -> GUI below
 
     # Legacy GUI launch: anypkg [--auto] [package-file]
